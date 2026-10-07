@@ -1,0 +1,174 @@
+A Simple Game House Application — COMP3234 / ELEC3443
+====================================================
+
+Requirements and files
+----------------------
+Python 3.8 or later; standard library only, with no pip dependencies.
+Run the terminal client on Linux or macOS (POSIX). Its single-threaded input
+loop uses select() on both standard input and the TCP socket; Windows console
+input does not support this interface. A terminal, pipe, or redirected file
+can supply client input.
+
+  GameServer.py  Multi-client TCP server and game/room state machine.
+  GameClient.py  Single-threaded interactive TCP client.
+  README         Setup, protocol, implementation, and testing instructions.
+
+Running
+-------
+Create a separate UserInfo.txt containing one username:password per line:
+
+  Jacky:12345
+  Bob:54321
+  Michael:abcde
+
+These are demonstration accounts, not real credentials. Usernames/passwords
+must be nonempty and contain no whitespace; usernames must not contain ':'.
+Blank lines are ignored; malformed entries and duplicate usernames are rejected
+at startup. Passwords may contain ':'. The server loads the file once at startup.
+
+Terminal 1:
+  python3 GameServer.py 22222 UserInfo.txt
+
+Terminal 2:
+  python3 GameClient.py localhost 22222
+
+Terminal 3 (and optionally Terminal 4):
+  python3 GameClient.py localhost 22222
+
+Use a different demonstration account for each client. Enter the username and
+password after the exact prompts; failed authentication repeats both prompts.
+The server has 10 rooms, numbered 1 through 10 (NUM_ROOMS in GameServer.py).
+It listens on all IPv4 interfaces. Both programs validate argument counts and
+ports (1–65535), and report startup errors without a user-facing traceback.
+
+Commands and example interaction
+--------------------------------
+After authentication, type a hall command:
+
+  /list       Display room counts: 3001 10 <ten occupancy counts>.
+  /enter N    Enter room N. First player waits; the second starts the game.
+  /exit       Receive 4001 Bye bye and close the client.
+
+For example, Jacky types /list and /enter 1, then receives 3011 Wait. Bob types
+/enter 1; both receive 3012 Game started. Please guess true or false. Each then
+types just true or false; the client sends /guess true or /guess false. After
+submitting a valid guess, wait for the other player's guess and the result.
+Both players automatically return to the hall after a result.
+
+If both guess true, or both guess false, both receive 3023 The result is a tie.
+If their guesses differ, the server chooses a random Boolean: exactly one
+receives 3021 You are the winner and the other receives 3022 You lost this game.
+Typing an invalid guess receives 4002 Unrecognized message and permits retry.
+Do not include /guess when typing a guess into this client.
+
+A third player entering an active room receives 3013 The room is full and stays
+in the hall. Only the hall permits /list, /enter and /exit. Waiting players send
+nothing; playing players may submit one valid guess. Malformed or out-of-state
+commands receive exactly 4002 Unrecognized message without changing game state.
+The client prints server replies without additional hall/guess prompts.
+
+Wire protocol and assumptions
+-----------------------------
+Transport is IPv4 TCP. Each command and response is a UTF-8 line terminated by
+'\n'; the delimiter is not part of the specified message text. CRLF is accepted.
+There is no JSON, length prefix, greeting, heartbeat, or extra protocol message.
+When testing with a raw socket, append '\n' to every command and read complete
+lines: TCP can split one message or combine several messages in a single recv().
+Unterminated bytes are buffered, not guessed to be a complete command.
+
+Commands are case-sensitive whitespace-separated tokens. /login requires
+exactly a username and password; /enter requires one ASCII integer in range;
+/guess accepts only the exact lowercase tokens true and false. Incoming command
+lines are limited to 4096 bytes. Invalid UTF-8 and oversized lines receive 4002;
+an oversized line is discarded through its newline before parsing resumes.
+Accounts are not globally reserved: the assignment assumes that the same user
+does not log in simultaneously. Session identity is the connection, not username.
+Normal /exit is only supported in the hall, as specified. TCP/passwords are
+unencrypted, as in the assignment; use demonstration credentials.
+
+Implementation and synchronization
+----------------------------------
+The main server thread accepts connections and starts one new handler thread
+for each new client socket. A Session holds the socket, username, state, room
+index, guess, and outgoing queue. Rooms contain Session objects. States are
+AUTHENTICATING, IN_HALL, WAITING, PLAYING, and DISCONNECTED.
+
+One threading.Lock protects all room membership and session/game state. /list
+reads its entire snapshot under this lock. Entry, guess validation, normal game
+resolution, and disconnect cleanup update state atomically under the same lock.
+Completion clears both guesses, room indices, and membership, returning both
+players to the hall before releasing the lock. A second thread therefore cannot
+resolve the same game or remove its players a second time.
+
+Responses are queued while holding the state lock. Only the socket's owning
+handler calls sendall(), outside that lock. FIFO queues preserve Wait/Start/
+Result ordering and prevent concurrent writes from interleaving. No application
+lock is held during network I/O, socket closure, or thread joins. A 0.2-second
+socket timeout lets idle handlers service queued notifications; idle receive
+timeouts do not disconnect players. A failed or timed-out send is a connection
+failure and triggers that handler's cleanup.
+
+Abnormal disconnections
+-----------------------
+Every handler uses try/except/finally and one idempotent cleanup function. EOF,
+reset, send failure, or an unexpected handler exception removes the session.
+A waiting player's room becomes empty. If a player leaves an unresolved game,
+cleanup clears the room and queues 3021 You are the winner for the remaining
+player, who returns to the hall immediately. Concurrent cleanup cannot award a
+second result. A failed result delivery cannot reopen an already completed game.
+The server continues accepting clients after an individual connection fails.
+
+The client monitors the server socket even while awaiting keyboard input. EOF
+and socket errors are reported gracefully, including during authentication,
+waiting, and playing. A guess sent just as the opponent disconnects may be
+rejected after the win notification; this late 4002 is printed without undoing
+the return to the hall. Delayed errors also cannot enable a second valid guess.
+Ctrl-C closes the client socket immediately; input EOF closes it when the
+current exchange permits keyboard input. Ctrl-C on the server shuts down
+active connections. Both sides enable TCP keepalive and
+attempt to tune it to a 15-second idle period, 5-second interval and 3 probes.
+Silent network loss is detectable only when TCP reports failure; exact timing
+depends on OS support and retransmission behavior. No application timeout
+mistakes an otherwise healthy, idle waiting player for a disconnected player.
+
+Testing
+-------
+Syntax check without creating __pycache__:
+  python3 -c "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text()) for p in ('GameServer.py','GameClient.py')]; print('Syntax OK')"
+
+Use the terminals above to check:
+1. Wrong then correct credentials; /list initially shows ten zero counts.
+2. Jacky enters room 1: Wait. Bob's /list shows one occupant; Bob enters room 1:
+   both start. Before either guesses, Michael's /list shows two occupants and
+   /enter 1 returns room full.
+3. Both type true: tie. /list shows room 1 empty. Repeat with both false, then
+   with different guesses to see exactly one winner and one loser.
+4. In the hall try /enter 0, /enter -1, /enter 11, /enter abc, /enter, /enter 1 2,
+   /list extra, /exit now, garbage, and a blank line: each returns 4002.
+5. During a game type maybe, then true: the invalid guess does not count.
+6. Close a waiting client with Ctrl-C: its room becomes empty. Restart it.
+   Start another game, close one player before guessing or after its guess:
+   the survivor wins, can immediately /list, and can reuse the room.
+7. Start games in different rooms concurrently. Finish one while the other
+   remains active, then reuse rooms repeatedly. Use raw newline-delimited TCP
+   clients to exercise simultaneous entries, duplicate guesses, out-of-state
+   commands, fragmented commands, and multiple commands in one write.
+8. Stop the server while a client is entering credentials, in the hall, waiting,
+   entering a guess, and waiting for its result. Each client reports the
+   disconnection without a traceback. Also try starting a client without a server.
+9. /exit from the hall prints 4001 Bye bye and Client ends and closes cleanly.
+10. With a scripted TCP peer, deliver 3021 followed by 4002 while a guess is in
+    flight. Verify the client stays usable for /list, another game, and /exit,
+    including when the error arrives after a new hall command has been sent.
+
+Submission
+----------
+Submit only GameServer.py, GameClient.py, and README. Supply your own UserInfo.txt
+when running; do not package credentials, tests, logs, caches, or IDE metadata.
+Copy these three files to a clean directory and repeat the run instructions.
+Replace STUDENTID below with your real student ID:
+
+  zip a1-STUDENTID.zip GameServer.py GameClient.py README
+
+Use a new archive (or check its listing so an older ZIP cannot retain extra files):
+  unzip -l a1-STUDENTID.zip
